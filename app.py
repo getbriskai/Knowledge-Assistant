@@ -342,14 +342,6 @@ def main():
                 except Exception as e:
                     st.error(f"Error processing documents: {e}")
 
-        # # Chunk display settings
-        # st.session_state.k_chunks = st.slider(
-        #     "Chunks to display",
-        #     min_value=1,
-        #     max_value=10,
-        #     value=st.session_state.k_chunks
-        # )
-
         # Display chunking statistics if available
         if st.session_state.chunks_info:
             st.subheader("📊 Chunking Statistics")
