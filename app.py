@@ -8,7 +8,6 @@ from langchain.chains import ConversationalRetrievalChain
 from langchain.memory import ConversationBufferMemory
 from langchain.retrievers import BM25Retriever
 from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
-from langchain_community.vectorstores import Chroma
 from sentence_transformers import CrossEncoder
 from langchain_core.retrievers import BaseRetriever
 from langchain.callbacks.manager import CallbackManagerForRetrieverRun
@@ -72,7 +71,7 @@ class CrossEncoderReranker:
 
 class HybridRetrieverWithReranking(BaseRetriever, BaseModel):
     bm25_retriever: BM25Retriever = Field(...)
-    vector_retriever: BaseRetriever = Field(...)
+    vector_retriever: Optional[BaseRetriever] = Field(default=None)  # Allow None
     reranker: CrossEncoderReranker = Field(...)
     k: int = Field(default=5)
 
@@ -85,9 +84,13 @@ class HybridRetrieverWithReranking(BaseRetriever, BaseModel):
         *,
         run_manager: Optional[CallbackManagerForRetrieverRun] = None
     ) -> List[Document]:
-        # Get documents from both retrievers
+        # Get documents from BM25 retriever
         bm25_docs = self.bm25_retriever.get_relevant_documents(query)
-        vector_docs = self.vector_retriever.get_relevant_documents(query)
+
+        # Get documents from vector retriever, if provided
+        vector_docs = []
+        if self.vector_retriever is not None:
+            vector_docs = self.vector_retriever.get_relevant_documents(query)
 
         # Combine and deduplicate documents
         seen_contents = set()
@@ -157,79 +160,22 @@ def get_chunks(text: str, pdf_files: List[io.BytesIO]) -> List[Document]:
 
     return documents
 
-def add_new_files_to_embeddings(new_files, vectorstore, persist_directory):
-    """Add new files to the existing vectorstore."""
-    if not new_files:
-        st.warning("Please upload files to add!")
-        return
-
-    # Ensure chunks_info is initialized
-    if 'chunks_info' not in st.session_state or st.session_state.chunks_info is None:
-        st.session_state.chunks_info = {'total_chunks': 0, 'chunks_per_doc': {}, 'avg_chunk_size': 0}
-
-    # Process all uploaded files, even if they have the same name
-    new_text = get_pdf_text(new_files)
-    new_chunks = get_chunks(new_text, new_files)
-
-    # Add new documents to the existing vectorstore
-    vectorstore.add_documents(new_chunks)
-    vectorstore.persist()  # Save updated vectorstore
-
-    # Update session state
-    for chunk in new_chunks:
-        doc_id = chunk.metadata['filename']
-        if doc_id not in st.session_state.chunks_info['chunks_per_doc']:
-            st.session_state.chunks_info['chunks_per_doc'][doc_id] = 0
-        st.session_state.chunks_info['chunks_per_doc'][doc_id] += 1
-
-    # Update total chunk count and average chunk size
-    st.session_state.chunks_info['total_chunks'] += len(new_chunks)
-    total_chunk_sizes = sum(len(chunk.page_content) for chunk in new_chunks)
-    current_total_size = (
-        st.session_state.chunks_info['avg_chunk_size'] * (st.session_state.chunks_info['total_chunks'] - len(new_chunks))
-        + total_chunk_sizes
-    )
-    st.session_state.chunks_info['avg_chunk_size'] = current_total_size / st.session_state.chunks_info['total_chunks']
-
-    st.success(f"Successfully added {len(new_files)} new files and updated embeddings!")
-
-def create_hybrid_retriever(text_chunks: List[Document], persist_directory: Optional[str] = None):
+def create_hybrid_retriever(text_chunks: List[Document]):
     """
-    Create a hybrid retriever combining BM25, ChromaDB, and CrossEncoder reranking.
-    Supports both in-memory and persistent storage for Chroma.
+    Create a hybrid retriever combining BM25 and CrossEncoder reranking without ChromaDB.
     """
-    embeddings = GoogleGenerativeAIEmbeddings(model='models/embedding-001')
-
-    # Create Chroma vectorstore (persistent or in-memory based on persist_directory)
-    vectorstore = Chroma.from_documents(
-        documents=text_chunks,
-        embedding=embeddings,
-        persist_directory=persist_directory  # None for in-memory
-    )
-
-    # Persist the vectorstore only if persistence is enabled
-    if persist_directory is not None:
-        vectorstore.persist()
-
-    # BM25 Retriever
     bm25_retriever = BM25Retriever.from_documents(text_chunks)
     bm25_retriever.k = 10
 
-    # Chroma Retriever
-    vector_retriever = vectorstore.as_retriever(search_kwargs={'k': 10})
-
-    # CrossEncoder Reranker
     reranker = CrossEncoderReranker(cross_encoder, k=5)
 
-    # Combine into a hybrid retriever
     hybrid_retriever = HybridRetrieverWithReranking(
         bm25_retriever=bm25_retriever,
-        vector_retriever=vector_retriever,
+        vector_retriever=None,  # No vector-based retriever
         reranker=reranker,
         k=5
     )
-    return hybrid_retriever, vectorstore
-
+    return hybrid_retriever, None
 
 # Create Conversation Chain
 def create_conversation_chain(retriever: BaseRetriever):
@@ -373,8 +319,7 @@ def main():
 
                     # Create or update vectorstore
                     hybrid_retriever, vectorstore = create_hybrid_retriever(
-                        text_chunks,
-                        persist_directory=None
+                        text_chunks
                     )
                     st.session_state.vectorstore = vectorstore
                     st.session_state.conversation = create_conversation_chain(hybrid_retriever)
@@ -396,20 +341,6 @@ def main():
                     st.success("Documents processed successfully!")
                 except Exception as e:
                     st.error(f"Error processing documents: {e}")
-
-        # Section for adding additional files
-        # st.subheader("Add More Documents")
-        # new_files = st.file_uploader("Upload Additional PDFs", type=['pdf'], accept_multiple_files=True)
-
-        # if st.button("Add to Vectorstore"):
-        #     if 'vectorstore' in st.session_state and st.session_state.vectorstore:
-        #         add_new_files_to_embeddings(
-        #             new_files=new_files,
-        #             vectorstore=st.session_state.vectorstore,
-        #             persist_directory=".chroma_db"  # Ensure you use the correct directory
-        #         )
-        #     else:
-        #         st.error("You need to process initial documents before adding more!")
 
         # Chunk display settings
         st.session_state.k_chunks = st.slider(
