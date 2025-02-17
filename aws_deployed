@@ -1,0 +1,778 @@
+import os
+import streamlit as st
+import google.generativeai as genai
+from PyPDF2 import PdfReader, PdfWriter
+import fitz
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.docstore.document import Document
+from langchain.chains import ConversationalRetrievalChain
+from langchain.memory import ConversationBufferMemory
+from langchain_community.retrievers import BM25Retriever
+from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
+from langchain_community.vectorstores import Chroma
+from sentence_transformers import CrossEncoder
+from langchain_core.retrievers import BaseRetriever
+from langchain.callbacks.manager import CallbackManagerForRetrieverRun
+from typing import List, Optional, Dict,Any
+from pydantic import BaseModel, Field
+from dataclasses import dataclass, asdict
+import io
+import base64
+from langchain_community.document_transformers import LongContextReorder
+import json
+from datetime import datetime
+import pickle
+import tempfile
+import shutil
+import time
+import stat
+import boto3
+from botocore.exceptions import ClientError
+import numpy as np
+from sklearn.metrics.pairwise import cosine_similarity
+# Constants
+S3_BUCKET_NAME = "knowledgebase69"
+AWS_ACCESS_KEY_ID = "xxxx"
+AWS_SECRET_ACCESS_KEY = "iL7N7ljO+YoLAOPNWy3xSSIS8GRlq+a7deNfsb39"
+AWS_REGION = os.getenv('AWS_REGION', 'us-east-1')
+
+# Configure Google API
+os.environ['GOOGLE_API_KEY'] = 'AIzaSyA-c7kcOdP6A74-T_NSGOyE8ajNn1-xIec'
+genai.configure(api_key=os.getenv('GOOGLE_API_KEY'))
+
+@dataclass
+class EnrichedChunk:
+    text: str
+    metadata: Dict
+    page_number: int
+    page_image: str
+
+
+def save_json_utf8(data, filepath):
+    with open(filepath, 'w', encoding='utf-8') as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+def load_json_utf8(filepath):
+    with open(filepath, 'r', encoding='utf-8') as f:
+        return json.load(f)
+
+class S3StorageManager:
+    def __init__(self, bucket_name: str, aws_access_key_id: Optional[str] = None, 
+                aws_secret_access_key: Optional[str] = None, region_name: Optional[str] = None):
+        self.bucket_name = bucket_name
+        self.s3_client = boto3.client(
+            's3',
+            aws_access_key_id=aws_access_key_id,
+            aws_secret_access_key=aws_secret_access_key,
+            region_name=region_name or 'us-east-1'
+        )
+        self.ensure_bucket_exists()
+
+    def ensure_bucket_exists(self):
+        try:
+            self.s3_client.head_bucket(Bucket=self.bucket_name)
+        except ClientError:
+            try:
+                self.s3_client.create_bucket(
+                    Bucket=self.bucket_name,
+                    CreateBucketConfiguration={'LocationConstraint': AWS_REGION}
+                )
+            except ClientError as e:
+                print(f"Error creating bucket: {e}")
+                raise
+
+    def save_to_s3(self, key: str, data: bytes):
+        """Generic method to save bytes data to S3"""
+        try:
+            self.s3_client.put_object(
+                Bucket=self.bucket_name,
+                Key=key,
+                Body=data
+            )
+        except ClientError as e:
+            print(f"Error saving to S3: {e}")
+            raise
+
+    def load_from_s3(self, key: str) -> Optional[bytes]:
+        """Generic method to load bytes data from S3"""
+        try:
+            response = self.s3_client.get_object(
+                Bucket=self.bucket_name,
+                Key=key
+            )
+            return response['Body'].read()
+        except ClientError as e:
+            if e.response['Error']['Code'] == 'NoSuchKey':
+                return None
+            print(f"Error loading from S3: {e}")
+            raise
+    
+    def load_vectorstore(self, embeddings, key_prefix: str = "vectorstore") -> Optional[Chroma]:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            persist_directory = os.path.join(temp_dir, "vectorstore")
+            os.makedirs(persist_directory, exist_ok=True)
+            
+            try:
+                # List all objects in the vectorstore prefix
+                response = self.s3_client.list_objects_v2(
+                    Bucket=self.bucket_name,
+                    Prefix=key_prefix
+                )
+                
+                if 'Contents' not in response:
+                    return None
+                
+                # Download all files
+                for obj in response['Contents']:
+                    s3_key = obj['Key']
+                    relative_path = os.path.relpath(s3_key, key_prefix)
+                    local_path = os.path.join(persist_directory, relative_path.replace('/', os.sep))
+                    
+                    # Ensure directory exists
+                    os.makedirs(os.path.dirname(local_path), exist_ok=True)
+                    
+                    # Download file
+                    self.s3_client.download_file(self.bucket_name, s3_key, local_path)
+                
+                # Load vectorstore from the temporary directory
+                return Chroma(
+                    persist_directory=persist_directory,
+                    embedding_function=embeddings,
+                    collection_metadata={"hnsw:space": "cosine"}
+                )
+            except ClientError as e:
+                print(f"Error loading from S3: {e}")
+                return None
+            except Exception as e:
+                print(f"Error loading vectorstore: {e}")
+                return None
+
+    def save_enriched_chunks(self, chunks: List[EnrichedChunk]):
+        """Save enriched chunks as JSON to S3"""
+        try:
+            chunks_dict = [asdict(chunk) for chunk in chunks]
+            json_data = json.dumps(chunks_dict, ensure_ascii=False).encode('utf-8')
+            self.save_to_s3('enriched_chunks.json', json_data)
+        except Exception as e:
+            print(f"Error saving enriched chunks: {e}")
+            raise
+
+    def load_enriched_chunks(self) -> List[EnrichedChunk]:
+        """Load enriched chunks from S3"""
+        try:
+            data = self.load_from_s3('enriched_chunks.json')
+            if data is None:
+                return []
+            chunks_dict = json.loads(data.decode('utf-8'))
+            return [EnrichedChunk(**chunk) for chunk in chunks_dict]
+        except Exception as e:
+            print(f"Error loading enriched chunks: {e}")
+            return []
+
+    def save_embeddings(self, texts: List[str], embeddings_model):
+        """Save text embeddings to S3"""
+        try:
+            # Generate embeddings
+            embeddings_list = embeddings_model.embed_documents(texts)
+            
+            # Save embeddings and texts
+            data = {
+                'texts': texts,
+                'embeddings': embeddings_list
+            }
+            pickle_data = pickle.dumps(data)
+            self.save_to_s3('embeddings.pkl', pickle_data)
+        except Exception as e:
+            print(f"Error saving embeddings: {e}")
+            raise
+
+    def load_embeddings(self) -> Optional[Dict]:
+        """Load embeddings from S3"""
+        try:
+            data = self.load_from_s3('embeddings.pkl')
+            if data is None:
+                return None
+            return pickle.loads(data)
+        except Exception as e:
+            print(f"Error loading embeddings: {e}")
+            return None
+
+    def clear_storage(self):
+        """Clear all objects in the S3 bucket"""
+        try:
+            paginator = self.s3_client.get_paginator('list_objects_v2')
+            for page in paginator.paginate(Bucket=self.bucket_name):
+                if 'Contents' in page:
+                    objects_to_delete = [{'Key': obj['Key']} for obj in page['Contents']]
+                    if objects_to_delete:
+                        self.s3_client.delete_objects(
+                            Bucket=self.bucket_name,
+                            Delete={'Objects': objects_to_delete}
+                        )
+            return True
+        except ClientError as e:
+            print(f"Error clearing S3 storage: {e}")
+            return False
+
+cross_encoder = CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')
+
+class CrossEncoderReranker:
+    def __init__(self, cross_encoder_model, k=5):
+        self.cross_encoder = cross_encoder_model
+        self.k = k
+
+    def rerank(self, query: str, documents: List[Document]) -> List[Document]:
+        if not documents:
+            return []
+        
+        pairs = [[query, doc.page_content] for doc in documents]
+        scores = self.cross_encoder.predict(pairs)
+        
+        for doc, score in zip(documents, scores):
+            doc.metadata['rerank_score'] = float(score)
+        
+        doc_score_pairs = list(zip(documents, scores))
+        reranked_docs = sorted(doc_score_pairs, key=lambda x: x[1], reverse=True)
+        
+        return [doc for doc, score in reranked_docs[:self.k]]
+
+class HybridRetrieverWithReranking(BaseRetriever, BaseModel):
+    bm25_retriever: BM25Retriever = Field(...)
+    vector_retriever: BaseRetriever = Field(...)
+    reranker: CrossEncoderReranker = Field(...)
+    k: int = Field(default=5)
+    
+    class Config:
+        arbitrary_types_allowed = True
+
+    def _get_relevant_documents(
+        self,
+        query: str,
+        *,
+        run_manager: Optional[CallbackManagerForRetrieverRun] = None
+    ) -> List[Document]:
+        bm25_docs = self.bm25_retriever.get_relevant_documents(query)
+        vector_docs = self.vector_retriever.get_relevant_documents(query)
+        
+        seen_contents = set()
+        combined_docs = []
+        
+        for doc in bm25_docs + vector_docs:
+            if doc.page_content not in seen_contents:
+                combined_docs.append(doc)
+                seen_contents.add(doc.page_content)
+        
+        reordering = LongContextReorder()
+        reordered_docs = reordering.transform_documents(combined_docs)
+        
+        return self.reranker.rerank(query, reordered_docs)
+
+def process_pdf(pdf_file, chunk_size=1000, chunk_overlap=200):
+    enriched_chunks = []
+    
+    # Create temporary file with .pdf suffix and binary write mode
+    with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf', mode='wb') as tmp_file:
+        tmp_file.write(pdf_file.getvalue())
+        tmp_path = tmp_file.name
+    
+    try:
+        doc = fitz.open(tmp_path)
+        pdf_reader = PdfReader(io.BytesIO(pdf_file.getvalue()))
+        
+        splitter = RecursiveCharacterTextSplitter(
+            separators=["\n\n", "\n", ".", " "],
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap
+        )
+        
+        for page_num in range(len(pdf_reader.pages)):
+            text = pdf_reader.pages[page_num].extract_text()
+            page = doc[page_num]
+            pix = page.get_pixmap()
+            img_data = pix.tobytes()
+            img_base64 = base64.b64encode(img_data).decode()
+            
+            chunks = splitter.split_text(text)
+            
+            # Generate unique document identifier
+            doc_id = f"{pdf_file.name}_{page_num+1}"
+            
+            for chunk_idx, chunk_text in enumerate(chunks):
+                enriched_chunk = EnrichedChunk(
+                    text=chunk_text,
+                    metadata={
+                        'unique_doc_id': doc_id,  # Unique identifier for document and page
+                        'original_filename': pdf_file.name,
+                        'page_number': page_num + 1,
+                        'total_pages': len(pdf_reader.pages),
+                        'chunk_index': chunk_idx,
+                        'chunk_size': len(chunk_text),
+                        'total_chunks_in_page': len(chunks)
+                    },
+                    page_number=page_num + 1,
+                    page_image=img_base64
+                )
+                enriched_chunks.append(enriched_chunk)
+        
+        doc.close()
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except PermissionError:
+            time.sleep(0.1)
+            try:
+                os.unlink(tmp_path)
+            except PermissionError:
+                pass  # If still can't delete, let the OS handle it later
+
+    return enriched_chunks
+
+def create_hybrid_retriever(text_chunks: List[Document], s3_manager: S3StorageManager):
+    """Create hybrid retriever with S3-based storage"""
+    try:
+        # Initialize embeddings
+        embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
+        
+        # Generate and save embeddings
+        texts = [doc.page_content for doc in text_chunks]
+        s3_manager.save_embeddings(texts, embeddings)
+        
+        # Create documents with consistent metadata
+        documents = []
+        for chunk in text_chunks:
+            metadata = {
+                'unique_doc_id': f"{chunk.metadata.get('original_filename')}_{chunk.metadata.get('page_number')}",
+                'original_filename': chunk.metadata.get('original_filename'),
+                'page_number': chunk.metadata.get('page_number'),
+                'chunk_index': chunk.metadata.get('chunk_index'),
+                'chunk_size': chunk.metadata.get('chunk_size'),
+                'total_chunks_in_page': chunk.metadata.get('total_chunks_in_page')
+            }
+            documents.append(Document(page_content=chunk.page_content, metadata=metadata))
+        
+        # Create BM25 retriever
+        bm25_retriever = BM25Retriever.from_documents(documents)
+        bm25_retriever.k = 10
+        
+        # Create custom vector retriever using S3-stored embeddings
+        class S3VectorRetriever(BaseRetriever, BaseModel):
+            s3_manager: S3StorageManager = Field(...)
+            embeddings_model: Any = Field(...)
+            documents: List[Document] = Field(...)
+            k: int = Field(default=10)
+            
+            class Config:
+                arbitrary_types_allowed = True
+            
+            def _get_relevant_documents(
+                self,
+                query: str,
+                *,
+                run_manager: Optional[CallbackManagerForRetrieverRun] = None
+            ) -> List[Document]:
+                # Load stored embeddings
+                stored_data = self.s3_manager.load_embeddings()
+                if not stored_data:
+                    return []
+                
+                # Generate query embedding
+                query_embedding = self.embeddings_model.embed_query(query)
+                
+                # Calculate similarities
+                similarities = cosine_similarity(
+                    [query_embedding],
+                    stored_data['embeddings']
+                )[0]
+                
+                # Get top k results
+                top_k_indices = np.argsort(similarities)[-self.k:][::-1]
+                
+                return [self.documents[i] for i in top_k_indices]
+        
+        vector_retriever = S3VectorRetriever(
+            s3_manager=s3_manager,
+            embeddings_model=embeddings,
+            documents=documents,
+            k=10
+        )
+        
+        # Create hybrid retriever with reranking
+        reranker = CrossEncoderReranker(cross_encoder, k=5)
+        hybrid_retriever = HybridRetrieverWithReranking(
+            bm25_retriever=bm25_retriever,
+            vector_retriever=vector_retriever,
+            reranker=reranker,
+            k=5
+        )
+        
+        return hybrid_retriever, documents
+    
+    except Exception as e:
+        print(f"Error creating hybrid retriever: {e}")
+        raise
+
+class CrossEncoderReranker:
+    def __init__(self, cross_encoder_model, k=5):
+        self.cross_encoder = cross_encoder_model
+        self.k = k
+
+    def rerank(self, query: str, documents: List[Document]) -> List[Document]:
+        if not documents:
+            return []
+        
+        pairs = [[query, doc.page_content] for doc in documents]
+        scores = self.cross_encoder.predict(pairs)
+        
+        for doc, score in zip(documents, scores):
+            doc.metadata['rerank_score'] = float(score)
+        
+        doc_score_pairs = list(zip(documents, scores))
+        reranked_docs = sorted(doc_score_pairs, key=lambda x: x[1], reverse=True)
+        
+        return [doc for doc, score in reranked_docs[:self.k]]
+
+class HybridRetrieverWithReranking(BaseRetriever, BaseModel):
+    bm25_retriever: BM25Retriever = Field(...)
+    vector_retriever: BaseRetriever = Field(...)
+    reranker: CrossEncoderReranker = Field(...)
+    k: int = Field(default=5)
+    
+    class Config:
+        arbitrary_types_allowed = True
+
+    def _get_relevant_documents(
+        self,
+        query: str,
+        *,
+        run_manager: Optional[CallbackManagerForRetrieverRun] = None
+    ) -> List[Document]:
+        bm25_docs = self.bm25_retriever.get_relevant_documents(query)
+        vector_docs = self.vector_retriever.get_relevant_documents(query)
+        
+        # Deduplicate documents
+        seen_contents = set()
+        combined_docs = []
+        
+        for doc in bm25_docs + vector_docs:
+            content_hash = hash(doc.page_content)
+            if content_hash not in seen_contents:
+                combined_docs.append(doc)
+                seen_contents.add(content_hash)
+        
+        # Reorder documents for better context
+        reordering = LongContextReorder()
+        reordered_docs = reordering.transform_documents(combined_docs)
+        
+        # Rerank and return top k documents
+        return self.reranker.rerank(query, reordered_docs)
+
+def create_conversation_chain(retriever):
+    llm = ChatGoogleGenerativeAI(
+        model="gemini-1.5-pro-latest",
+        temperature=0.7
+    )
+    
+    memory = ConversationBufferMemory(
+        memory_key='chat_history',
+        return_messages=True,
+        output_key='answer'
+    )
+    
+    conversation_chain = ConversationalRetrievalChain.from_llm(
+        llm=llm,
+        retriever=retriever,
+        memory=memory,
+        return_source_documents=True,
+        combine_docs_chain_kwargs={'prompt': None}
+    )
+    return conversation_chain
+
+def display_chunks(chunks: List[Document], enriched_chunks: List[EnrichedChunk], k=5):
+    st.subheader(f"Top {k} Most Relevant Chunks")
+    
+    sorted_chunks = sorted(
+        chunks,
+        key=lambda x: x.metadata.get('rerank_score', 0),
+        reverse=True
+    )
+    
+    top_chunks = sorted_chunks[:k]
+    
+    for i, chunk in enumerate(top_chunks, 1):
+        st.markdown("---")
+        
+        st.markdown(f"""
+        ### Chunk {i} 
+        <span style="color: #007bff; font-weight: bold;">
+            Relevance Score: {chunk.metadata.get('rerank_score', 'N/A'):.4f}
+        </span>
+        """, unsafe_allow_html=True)
+        
+        col1, col2 = st.columns([1, 1])
+        
+        with col1:
+            st.markdown("**Text Content:**")
+            st.markdown(f"```text\n{chunk.page_content}\n```")
+            
+            st.markdown("**Metadata:**")
+            metadata_display = {
+                "Original Filename": chunk.metadata.get('original_filename', 'Unknown'),
+                "Page Number": chunk.metadata.get('page_number', 'Unknown'),
+                "Chunk Index": chunk.metadata.get('chunk_index', 'N/A'),
+                "Chunk Size": chunk.metadata.get('chunk_size', 'N/A'),
+                "Relevance Score": f"{chunk.metadata.get('rerank_score', 'N/A'):.4f}"
+            }
+            st.json(metadata_display)
+        
+        with col2:
+            st.markdown("**Page Preview:**")
+            
+            matching_enriched = next(
+                (ec for ec in enriched_chunks 
+                 if ec.metadata['unique_doc_id'] == chunk.metadata.get('unique_doc_id')),
+                None
+            )
+            
+            if matching_enriched:
+                try:
+                    st.image(
+                        base64.b64decode(matching_enriched.page_image),
+                        caption=f"Page {matching_enriched.page_number}",
+                        use_container_width=True
+                    )
+                except Exception as e:
+                    st.error(f"Error displaying page image: {str(e)}")
+            else:
+                st.warning("Page preview unavailable")
+            
+
+def handle_user_input(user_question):
+    if st.session_state.conversation is not None:
+        response = st.session_state.conversation({'question': user_question})
+        
+        st.write(f"🤖 **Assistant:** {response['answer']}")
+        st.write("---")
+        
+        if 'source_documents' in response:
+            display_chunks(
+                response['source_documents'],
+                st.session_state.enriched_chunks,
+                k=st.session_state.get('k_chunks', 5)
+            )
+
+def main():
+    st.set_page_config(page_title="Enhanced Document Chat", layout="wide")
+    st.header("💬 Chat with Your Documents")
+
+    # Initialize session states
+    for state in ['conversation', 'vectorstore', 'k_chunks', 'enriched_chunks', 'pdf_files', 'active_tab']:
+        if state not in st.session_state:
+            st.session_state[state] = None
+    
+    # Initialize active_tab default value
+    if st.session_state.active_tab is None:
+        st.session_state.active_tab = "Chat Interface"
+    
+    st.session_state.k_chunks = st.session_state.k_chunks or 5
+
+    # Initialize S3 Manager BEFORE sidebar
+    try:
+        s3_manager = S3StorageManager(
+            bucket_name=S3_BUCKET_NAME,
+            aws_access_key_id=AWS_ACCESS_KEY_ID,
+            aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
+            region_name=AWS_REGION
+        )
+    except Exception as e:
+        st.error(f"Error initializing S3 storage: {str(e)}")
+        return
+
+    # Sidebar setup
+    with st.sidebar:
+        st.subheader("📤 Upload Documents")
+        uploaded_files = st.file_uploader("Upload PDFs", type=['pdf'], accept_multiple_files=True)
+        
+        if uploaded_files:
+            if st.button("Process Documents", key="sidebar_process_docs"):
+                with st.spinner("Processing documents..."):
+                    try:
+                        all_chunks = []
+                        enriched_chunks = []
+                        
+                        for pdf_file in uploaded_files:
+                            with st.status(f"Processing {pdf_file.name}..."):
+                                new_enriched_chunks = process_pdf(pdf_file)
+                                enriched_chunks.extend(new_enriched_chunks)
+                                documents = [
+                                    Document(page_content=ec.text, metadata=ec.metadata)
+                                    for ec in new_enriched_chunks
+                                ]
+                                all_chunks.extend(documents)
+                        
+                        with st.status("Saving to S3..."):
+                            s3_manager.save_enriched_chunks(enriched_chunks)
+                            hybrid_retriever = create_hybrid_retriever(all_chunks, s3_manager)[0]
+                            st.session_state.conversation = create_conversation_chain(hybrid_retriever)
+                            st.session_state.enriched_chunks = enriched_chunks
+                            
+                        st.success("Documents processed and saved successfully!")
+                        
+                    except Exception as e:
+                        st.error(f"Error processing documents: {str(e)}")
+                        return
+
+        # Document Statistics Section
+        st.subheader("📊 Document Statistics")
+        if st.session_state.enriched_chunks:
+            total_chunks = len(st.session_state.enriched_chunks)
+            unique_docs = len(set(chunk.metadata.get('original_filename', 'Unknown') 
+                                for chunk in st.session_state.enriched_chunks))
+            avg_chunk_size = sum(len(chunk.text) for chunk in st.session_state.enriched_chunks) / total_chunks if total_chunks > 0 else 0
+            
+            st.write(f"Total Documents: {unique_docs}")
+            st.write(f"Total Chunks: {total_chunks}")
+            st.write(f"Average Chunk Size: {avg_chunk_size:.0f} characters")
+            
+            st.subheader("📑 Chunks per Document")
+            chunks_per_doc = {}
+            for chunk in st.session_state.enriched_chunks:
+                filename = chunk.metadata.get('original_filename', 'Unknown')
+                chunks_per_doc[filename] = chunks_per_doc.get(filename, 0) + 1
+            
+            for doc, count in chunks_per_doc.items():
+                st.write(f"- {doc}: {count} chunks")
+        
+        # Display Settings
+        st.subheader("⚙️ Display Settings")
+        st.session_state.k_chunks = st.slider(
+            "Number of chunks to display",
+            min_value=1,
+            max_value=10,
+            value=st.session_state.k_chunks
+        )
+
+    try:
+        s3_manager = S3StorageManager(
+            bucket_name=S3_BUCKET_NAME,
+            aws_access_key_id=AWS_ACCESS_KEY_ID,
+            aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
+            region_name=AWS_REGION
+        )
+    except Exception as e:
+        st.error(f"Error initializing S3 storage: {str(e)}")
+        return
+
+    if not os.getenv('GOOGLE_API_KEY'):
+        st.error("GOOGLE_API_KEY environment variable is not set.")
+        return
+
+    # Load existing data from S3
+    if st.session_state.vectorstore is None:
+        try:
+            embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
+            st.session_state.vectorstore = s3_manager.load_vectorstore(embeddings)
+        except Exception as e:
+            st.warning(f"Could not load existing vectorstore: {str(e)}")
+
+    if st.session_state.enriched_chunks is None:
+        try:
+            st.session_state.enriched_chunks = s3_manager.load_enriched_chunks()
+        except Exception as e:
+            st.warning(f"Could not load existing chunks: {str(e)}")
+
+    # Initialize conversation chain if needed
+    if st.session_state.vectorstore is not None and st.session_state.conversation is None:
+        try:
+            hybrid_retriever, _ = create_hybrid_retriever([
+                Document(page_content=ec.text, metadata=ec.metadata)
+                for ec in st.session_state.enriched_chunks
+            ], s3_manager)
+            st.session_state.conversation = create_conversation_chain(hybrid_retriever)
+        except Exception as e:
+            st.error(f"Error creating conversation chain: {str(e)}")
+
+    # Main interface
+    if st.session_state.conversation is None:
+        st.info("👈 Upload documents in the sidebar to create a knowledge base")
+    else:
+        # Create tabs with the active tab maintained
+        tab1, tab2 = st.tabs(["Chat Interface","Document Viewer"])
+        
+        # Document Viewer Tab
+        with tab2:
+            if st.session_state.enriched_chunks:
+                chunk_indices = range(len(st.session_state.enriched_chunks))
+                selected_chunk = st.selectbox(
+                    "Select chunk to view:",
+                    chunk_indices,
+                    format_func=lambda x: f"Chunk {x+1} (Page {st.session_state.enriched_chunks[x].page_number})"
+                )
+                
+                chunk = st.session_state.enriched_chunks[selected_chunk]
+                
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.subheader("Chunk Text")
+                    st.text_area("Text", chunk.text, height=200)
+                    st.json(chunk.metadata)
+                
+                with col2:
+                    st.subheader("Page Preview")
+                    try:
+                        st.image(
+                            base64.b64decode(chunk.page_image),
+                            caption=f"Page {chunk.page_number}",
+                            use_container_width=True
+                        )
+                    except Exception as e:
+                        st.error(f"Error displaying page image: {str(e)}")
+        
+        # Chat Interface Tab
+        with tab1:
+            user_question = st.text_input("Ask a question about your documents:")
+            if user_question:
+                with st.spinner("Generating response..."):
+                    try:
+                        handle_user_input(user_question)
+                    except Exception as e:
+                        st.error(f"Error generating response: {str(e)}")
+            
+            col1, col2 = st.columns(2)
+            with col1:
+                if st.button("Clear Chat History"):
+                    try:
+                        if st.session_state.conversation:
+                            st.session_state.conversation.memory.clear()
+                        st.success("Chat history cleared!")
+                    except Exception as e:
+                        st.error(f"Error clearing chat history: {str(e)}")
+            
+            with col2:
+                if st.button("Clear Knowledge Base"):
+                    try:
+                        if s3_manager.clear_storage():
+                            for state in ['conversation', 'vectorstore', 'enriched_chunks', 'pdf_files']:
+                                st.session_state[state] = None
+                            st.success("Knowledge base cleared successfully!")
+                            st.info("Please refresh the page to start fresh.")
+                            time.sleep(1)
+                            st.rerun()  # Replace experimental_rerun() with rerun()
+                        else:
+                            st.error("Error clearing knowledge base. Please try again.")
+                    except Exception as e:
+                        st.error(f"Error clearing knowledge base: {str(e)}")
+                        st.info("Try refreshing the page and clearing again.")
+
+    # Footer
+    st.markdown("---")
+    st.markdown("""
+    💡 **Tips:**
+    - Upload multiple PDFs for comprehensive document analysis
+    - Use the Document Viewer to explore individual chunks
+    - Check source pages for context in chat responses
+    - Your knowledge base is automatically saved to S3
+    """)
+
+
+if __name__ == "__main__":
+    main()
